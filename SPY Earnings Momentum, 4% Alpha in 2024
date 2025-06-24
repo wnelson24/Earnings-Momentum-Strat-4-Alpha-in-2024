@@ -1,0 +1,100 @@
+# region imports
+from AlgorithmImports import *
+# endregion
+from QuantConnect.Algorithm import QCAlgorithm
+from QuantConnect import Resolution
+from datetime import timedelta
+from System import DayOfWeek
+
+class GrowthMomentumScored(QCAlgorithm):
+    def Initialize(self):
+        self.SetStartDate(2024, 1, 1)
+        self.SetEndDate(2024, 12, 31)
+        self.SetCash(100000)
+
+        self.last_selection = []
+        self.rebalance_flag = False
+        self.scores = {}
+
+        self.spy_holdings = [
+            "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA", "BRK.B", "UNH", "XOM",
+            "JNJ", "V", "JPM", "PG", "MA", "HD", "LLY", "CVX", "MRK", "ABBV", "PEP", "KO", 
+            "AVGO", "COST", "WMT", "DIS", "BAC", "ADBE", "PFE", "CSCO", "NFLX", "MCD", "TMO",
+            "INTC", "ABT", "CRM", "ACN", "TXN", "VZ", "LIN", "DHR", "QCOM", "NEE", "PM", "NKE",
+            "BMY", "HON", "UNP", "MS", "GS", "AMD", "RTX", "NOW", "INTU", "CAT", "LMT", "AMAT",
+            "LOW", "SPGI", "MDT", "ISRG", "BLK", "BKNG", "GE", "DE", "ZTS", "ADP", "SYK", "SCHW",
+            "GILD", "CI", "MO", "T", "C", "AXP", "BA", "USB", "PLD", "CB", "SO", "DUK", "PNC",
+            "CL", "ADI", "MMC", "BDX", "EW", "VRTX", "FDX", "EMR", "REGN", "CSX", "ETN", "COF",
+            "PGR", "AON", "NSC", "ORLY", "APD", "HCA"
+        ]
+
+        self.UniverseSettings.Resolution = Resolution.Daily
+        self.AddUniverse(self.CoarseSelection, self.FineSelection)
+
+        self.Schedule.On(self.DateRules.Every(DayOfWeek.Monday), self.TimeRules.At(10, 0), self.SetRebalanceFlag)
+
+    def CoarseSelection(self, coarse):
+        return [x.Symbol for x in coarse if x.Symbol.Value in self.spy_holdings]
+
+    def FineSelection(self, fine):
+        symbols = []
+        self.scores.clear()
+
+        for stock in fine:
+            symbol = stock.Symbol
+            try:
+                rev_growth = stock.OperationRatios.RevenueGrowth.OneYear
+                if rev_growth is None or rev_growth < 0.05:
+                    continue
+
+                hist = self.History(symbol, 252, Resolution.Daily)
+                if hist.empty or "close" not in hist.columns or len(hist) < 252:
+                    continue
+
+                price_now = hist["close"].iloc[-1]
+                price_12m = hist["close"].iloc[0]
+                ret_12m = (price_now - price_12m) / price_12m
+                if ret_12m <= 0:
+                    continue
+
+                atr = hist["close"].rolling(window=14).apply(lambda x: max(x) - min(x)).iloc[-1]
+                vol = atr / price_now if price_now > 0 else None
+                if vol is None or vol <= 0:
+                    continue
+
+                score = 0.6 * ret_12m + 0.4 * rev_growth
+                self.scores[symbol] = (score, vol)
+
+                symbols.append(symbol)
+            except:
+                continue
+
+        if symbols:
+            vols = [self.scores[s][1] for s in symbols]
+            vol_cutoff = sorted(vols)[int(0.9 * len(vols))]
+            symbols = [s for s in symbols if self.scores[s][1] <= vol_cutoff]
+
+        top = sorted(symbols, key=lambda s: self.scores[s][0], reverse=True)[:20]
+        self.last_selection = top
+        self.Debug(f"{self.Time.date()}: Selected {len(top)} stocks")
+        return top
+
+    def SetRebalanceFlag(self):
+        self.rebalance_flag = True
+
+    def OnData(self, data):
+        if not self.rebalance_flag:
+            return
+        self.rebalance_flag = False
+
+        for kvp in self.Portfolio:
+            if kvp.Value.Invested and kvp.Key not in self.last_selection:
+                self.Liquidate(kvp.Key)
+
+        if self.last_selection:
+            weight = 1.0 / len(self.last_selection)
+            for sym in self.last_selection:
+                if self.Securities.ContainsKey(sym) and self.Securities[sym].IsTradable:
+                    self.SetHoldings(sym, weight)
+
+
